@@ -1,0 +1,137 @@
+name: Validate final XP integration
+
+on:
+  push:
+    branches: [codex/proof-donetick-final-r1654]
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    name: Backend ${{ matrix.source }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - source: candidate
+            ref: 238329f65b5e67853dddcc16849c721e4ccba2f7
+    env:
+      GOMAXPROCS: '2'
+      GOTOOLCHAIN: local
+      CGO_ENABLED: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.ref }}
+          persist-credentials: false
+      - uses: actions/setup-go@v4
+        with:
+          go-version: '1.24.3'
+          cache: false
+      - name: Verify exact source
+        run: |
+          test "$(git rev-parse HEAD)" = '${{ matrix.ref }}'
+          test -z "$(git status --porcelain)"
+          mkdir -p "$RUNNER_TEMP/evidence"
+          git rev-parse HEAD HEAD^{tree} > "$RUNNER_TEMP/evidence/source.txt"
+          go version > "$RUNNER_TEMP/evidence/go-version.txt"
+      - name: Full tests, vet, UTC check and build
+        run: |
+          set +e
+          go test -json ./... > "$RUNNER_TEMP/evidence/tests.jsonl" 2>&1
+          echo "tests=$?" >> "$RUNNER_TEMP/evidence/exits.txt"
+          go vet ./... > "$RUNNER_TEMP/evidence/vet.log" 2>&1
+          echo "vet=$?" >> "$RUNNER_TEMP/evidence/exits.txt"
+          bash scripts/check-time-utc.sh > "$RUNNER_TEMP/evidence/utc.log" 2>&1
+          echo "utc=$?" >> "$RUNNER_TEMP/evidence/exits.txt"
+          go build ./... > "$RUNNER_TEMP/evidence/build.log" 2>&1
+          echo "build=$?" >> "$RUNNER_TEMP/evidence/exits.txt"
+          cat "$RUNNER_TEMP/evidence/exits.txt"
+      - name: Verify final source and evidence hashes
+        if: always()
+        run: |
+          git diff --exit-code
+          test -z "$(git status --porcelain)"
+          test "$(git rev-parse HEAD)" = '${{ matrix.ref }}'
+          cd "$RUNNER_TEMP/evidence"
+          sha256sum * > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: backend-${{ matrix.source }}
+          path: ${{ runner.temp }}/evidence
+          retention-days: 7
+          if-no-files-found: error
+      - name: Preserve actual command outcome
+        if: always()
+        run: |
+          test "$(wc -l < "$RUNNER_TEMP/evidence/exits.txt")" -eq 4
+          ! grep -Ev '^[a-z]+=0$' "$RUNNER_TEMP/evidence/exits.txt"
+
+  frontend:
+    name: Frontend ${{ matrix.source }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - source: candidate
+            ref: 2467314ad047272a1e9c78ca2d65e9310a8b92ca
+    env:
+      POSTHOG_UPLOAD_SOURCEMAPS: 'false'
+      VITE_APP_API_URL: http://127.0.0.1:2029
+      VITE_APP_ENVIROMENT: selfhosted
+      HUSKY: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: pythonyx135793/frontend
+          ref: ${{ matrix.ref }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.12.0'
+          cache: ''
+      - name: Verify exact source
+        run: |
+          test "$(git rev-parse HEAD)" = '${{ matrix.ref }}'
+          test -z "$(git status --porcelain)"
+          mkdir -p "$RUNNER_TEMP/evidence"
+          git rev-parse HEAD HEAD^{tree} > "$RUNNER_TEMP/evidence/source.txt"
+          node --version > "$RUNNER_TEMP/evidence/node-version.txt"
+      - name: Locked dependencies
+        run: npm ci --no-audit --no-fund
+      - name: Production build, lint and translations after import-only fix
+        run: |
+          set +e
+          npm run build > "$RUNNER_TEMP/evidence/build.log" 2>&1
+          echo "build=$?" >> "$RUNNER_TEMP/evidence/exits.txt"
+          node node_modules/eslint/bin/eslint.js . > "$RUNNER_TEMP/evidence/eslint.log" 2>&1
+          echo "eslint=$?" >> "$RUNNER_TEMP/evidence/exits.txt"
+          npm run lint:i18n > "$RUNNER_TEMP/evidence/i18n.log" 2>&1
+          echo "i18n=$?" >> "$RUNNER_TEMP/evidence/exits.txt"
+          cat "$RUNNER_TEMP/evidence/exits.txt"
+      - name: Verify final source and evidence hashes
+        if: always()
+        run: |
+          git diff --exit-code
+          test -z "$(git status --porcelain)"
+          test "$(git rev-parse HEAD)" = '${{ matrix.ref }}'
+          cd "$RUNNER_TEMP/evidence"
+          sha256sum * > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: frontend-${{ matrix.source }}
+          path: ${{ runner.temp }}/evidence
+          retention-days: 7
+          if-no-files-found: error
+      - name: Preserve actual command outcome
+        if: always()
+        run: |
+          test "$(wc -l < "$RUNNER_TEMP/evidence/exits.txt")" -eq 3
+          ! grep -Ev '^[a-z]+=0$' "$RUNNER_TEMP/evidence/exits.txt"
