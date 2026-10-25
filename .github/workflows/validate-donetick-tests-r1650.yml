@@ -1,0 +1,53 @@
+name: Validate corrected XP integration tests
+on:
+  push:
+    branches: [codex/proof-donetick-tests-r1650]
+permissions:
+  contents: read
+jobs:
+  tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      GOMAXPROCS: '2'
+      GOTOOLCHAIN: local
+      CGO_ENABLED: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: e08e04226664fa4d2d59d1a2e9e6e365b5a6a03f
+          persist-credentials: false
+      - uses: actions/setup-go@v4
+        with:
+          go-version: '1.24.3'
+          cache: false
+      - name: Verify exact final source
+        run: |
+          test "$(git rev-parse HEAD)" = e08e04226664fa4d2d59d1a2e9e6e365b5a6a03f
+          test -z "$(git status --porcelain)"
+          mkdir -p "$RUNNER_TEMP/evidence"
+          git rev-parse HEAD HEAD^{tree} > "$RUNNER_TEMP/evidence/source.txt"
+          go version > "$RUNNER_TEMP/evidence/go-version.txt"
+      - name: Full unchanged stock tests including new regressions
+        run: |
+          set +e
+          go test -json ./... > "$RUNNER_TEMP/evidence/tests.jsonl" 2>&1
+          result=$?
+          echo "tests=$result" > "$RUNNER_TEMP/evidence/exits.txt"
+          cat "$RUNNER_TEMP/evidence/exits.txt"
+          exit "$result"
+      - name: Verify final source and evidence hashes
+        if: always()
+        run: |
+          git diff --exit-code
+          test -z "$(git status --porcelain)"
+          test "$(git rev-parse HEAD)" = e08e04226664fa4d2d59d1a2e9e6e365b5a6a03f
+          cd "$RUNNER_TEMP/evidence"
+          sha256sum * > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: corrected-backend-candidate
+          path: ${{ runner.temp }}/evidence
+          retention-days: 7
+          if-no-files-found: error
