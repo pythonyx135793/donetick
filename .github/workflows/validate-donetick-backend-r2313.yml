@@ -1,0 +1,108 @@
+name: Validate backend XP and label privacy integration
+
+on:
+  push:
+    branches: [codex/proof-donetick-backend-r2313]
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    name: Backend ${{ matrix.source }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - source: candidate
+            ref: dd1cd963a4f27e9c780a47eec304294730760aa8
+          - source: incoming
+            ref: 93eac37a878c72e8403b2c0bbb6f6f0f06fd13fd
+    env:
+      GOMAXPROCS: '2'
+      GOTOOLCHAIN: local
+      CGO_ENABLED: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.ref }}
+          persist-credentials: false
+      - uses: actions/setup-go@v4
+        with:
+          go-version: '1.24.3'
+          cache: false
+      - name: Verify exact source
+        run: |
+          test "$(git rev-parse HEAD)" = '${{ matrix.ref }}'
+          test -z "$(git status --porcelain)"
+          mkdir -p "$RUNNER_TEMP/evidence"
+          git rev-parse HEAD HEAD^{tree} > "$RUNNER_TEMP/evidence/source.txt"
+          go version > "$RUNNER_TEMP/evidence/go-version.txt"
+      - name: Full tests, vet, UTC check and build
+        run: |
+          set +e
+          go test -json -count=1 ./... > "$RUNNER_TEMP/evidence/tests.jsonl" 2>&1
+          echo "tests=$?" >> "$RUNNER_TEMP/evidence/exits.txt"
+          go vet ./... > "$RUNNER_TEMP/evidence/vet.log" 2>&1
+          echo "vet=$?" >> "$RUNNER_TEMP/evidence/exits.txt"
+          bash scripts/check-time-utc.sh > "$RUNNER_TEMP/evidence/utc.log" 2>&1
+          echo "utc=$?" >> "$RUNNER_TEMP/evidence/exits.txt"
+          go build ./... > "$RUNNER_TEMP/evidence/build.log" 2>&1
+          echo "build=$?" >> "$RUNNER_TEMP/evidence/exits.txt"
+          cat "$RUNNER_TEMP/evidence/exits.txt"
+      - name: Verify final source and evidence hashes
+        if: always()
+        run: |
+          git diff --exit-code
+          test -z "$(git status --porcelain)"
+          test "$(git rev-parse HEAD)" = '${{ matrix.ref }}'
+          cd "$RUNNER_TEMP/evidence"
+          sha256sum * > SHA256SUMS
+      - name: Print complete result summary and command diagnostics
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import collections,hashlib,json,os,pathlib
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'evidence'
+          raw=(root/'tests.jsonl').read_bytes()
+          events=[]
+          nonjson=[]
+          for line in raw.decode('utf-8',errors='replace').splitlines():
+              try: event=json.loads(line)
+              except ValueError:
+                  nonjson.append(line)
+                  continue
+              if isinstance(event,dict):events.append(event)
+          passed=[{'package':x.get('Package'),'test':x.get('Test')} for x in events if x.get('Action')=='pass' and 'Test' in x and '/' not in x['Test']]
+          failed=[{'package':x.get('Package'),'test':x.get('Test')} for x in events if x.get('Action')=='fail']
+          skipped=[{'package':x.get('Package'),'test':x.get('Test')} for x in events if x.get('Action')=='skip' and 'Test' in x]
+          result={'top_level_pass':len(passed),'failed':failed,'skipped_tests':skipped,'all_top_level_passed_tests':passed,'tests_jsonl_sha256':hashlib.sha256(raw).hexdigest()}
+          (root/'test-summary.json').write_text(json.dumps(result,sort_keys=True)+'\n')
+          print('RESULT_SUMMARY_JSON='+json.dumps(result,sort_keys=True))
+          for name in ['source.txt','go-version.txt','exits.txt','vet.log','utc.log','build.log']:
+              text=(root/name).read_text(errors='replace')
+              print('COMMAND_FILE_BEGIN '+name+'\n'+text+'\nCOMMAND_FILE_END '+name)
+          if nonjson: print('TEST_NONJSON='+json.dumps(nonjson[:100]))
+          for item in failed:
+              outs=[x.get('Output','') for x in events if x.get('Package')==item['package'] and x.get('Test')==item['test'] and x.get('Output')]
+              print('FAILED_TEST_OUTPUT='+json.dumps({'test':item,'tail':outs[-20:]}))
+          exits=dict(line.split('=',1) for line in (root/'exits.txt').read_text().splitlines())
+          print('PROOF_FILE_HASHES='+json.dumps({p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(root.iterdir()) if p.is_file()}))
+          assert int(exits['tests'])==0 and int(exits['utc'])==0 and int(exits['build'])==0
+          assert len(passed)>0 and not failed and not skipped
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: backend-${{ matrix.source }}
+          path: ${{ runner.temp }}/evidence
+          retention-days: 7
+          if-no-files-found: error
+      - name: Preserve actual command outcome
+        if: always()
+        run: |
+          test "$(wc -l < "$RUNNER_TEMP/evidence/exits.txt")" -eq 4
+          ! grep -Ev '^[a-z]+=0$' "$RUNNER_TEMP/evidence/exits.txt"
+
